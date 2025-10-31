@@ -6,9 +6,9 @@ This task is to implement a Decision Transformer model for algorithmic cryptocur
 
 This starter kit demonstrates how to use the provided code:
 
-1. **Data Preparation**: Process BTC order book data and generate Alpha101 technical factors
-2. **Supervised Learning**: Train RNN models to aggregate factor sequences into strong signals  
-3. **RL Agent Training**: Train reinforcement learning agents on market simulation
+1. **Data Preparation**: Process BTC order book data and generate New technical factors (Focused for Crypto)
+2. **Supervised Learning**: Train DiluatedCNN models to aggregate factor sequences into strong signals  
+3. **RL Agent Training**: Train reinforcement learning agents on market simulation --> DQN, PPO
 4. **Trajectory Collection**: Convert RL agent replay buffers to offline datasets
 5. **Decision Transformer Training**: Train transformer model on collected trajectories
 6. **Evaluation**: Test the trained model's trading performance on out-of-sample data
@@ -52,7 +52,7 @@ The dataset contains:
 - **Financial news sentiment analysis** with risk scores
 - **Time-aligned merged data** for training
 
-### 2. Alpha101 Technical Factor Generation
+### 2. New Technical Factor Generation
 
 Process raw BTC data and generate technical factors:
 
@@ -63,8 +63,8 @@ python seq_data.py
 
 This script:
 
-- Reads BTC CSV data and extracts level-5 order book information
-- Generates Alpha101 weak factors describing market microstructure
+- Reads BTC CSV data and extracts level order book information
+- Generates NewTech factors describing market microstructure
 - Converts data to normalized numpy arrays using z-score transformation
 - Outputs technical factor sequences for model training
 
@@ -83,9 +83,9 @@ python seq_run.py 0  # GPU ID
 
 This script:
 
-- Takes Alpha101 weak factor series as input
-- Trains recurrent neural networks to predict future price movements
-- Aggregates multiple weak factors into fewer strong signal factors
+- Takes NewTech factor series as input
+- Trains Diluated CNN to predict future price movements
+- Aggregates multiple factors into fewer strong signal factors
 - Uses early stopping based on validation loss improvement
 
 
