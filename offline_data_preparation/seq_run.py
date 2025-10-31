@@ -71,7 +71,7 @@ def train_model(gpu_id: int):
     num_layers = 4  # The number of layers in the recurrent network. The larger the value, the more content the recurrent network can remember.
 
     # Training duration, fitting degree
-    epoch = 2 ** 8
+    epoch = 2 ** 2
     wup_dim = 64 # The length of the sequence used for pre-warming of the recurrent network. The output loss will not be calculated during the pre-warming phase. The pre-warming phase is only used to obtain the hidden state of the recurrent network.
     valid_gap = 128  # The interval of validation data, that is, how many training batches are used to perform validation and print them out. It is recommended to print 10 to 1000 times during the entire training process
     num_patience = 8  # During model training, the number of steps that the loss can tolerate not getting a better value continuously.
@@ -89,8 +89,11 @@ def train_model(gpu_id: int):
     label_dim = seq_data.label_dim
 
     '''Model'''
-    from seq_net import RnnRegNet
-    net = RnnRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    from seq_net import RnnRegNet, DilatedCNNRegNet, TransformerRegNet
+    
+    # net = RnnRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    net = DilatedCNNRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    # net = TransformerRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
     optimizer = th.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = th.nn.MSELoss(reduction='none')
 
@@ -183,8 +186,10 @@ def valid_model(gpu_id: int):
     predict_ary_path = args.predict_ary_path
 
     '''Model'''
-    from seq_net import RnnRegNet
-    net = RnnRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    from seq_net import RnnRegNet, DilatedCNNRegNet, TransformerRegNet
+    # net = RnnRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    net = DilatedCNNRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
+    # net = TransformerRegNet(inp_dim=input_dim, mid_dim=mid_dim, out_dim=label_dim, num_layers=num_layers).to(device)
     net.load_state_dict(th.load(predict_net_path, map_location=lambda storage, loc: storage))
 
     predict_ary = np.empty_like(seq_data.valid_label_seq)

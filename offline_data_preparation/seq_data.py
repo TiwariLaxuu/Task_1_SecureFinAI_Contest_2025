@@ -8,6 +8,11 @@ from numpy import log
 from numpy import sign
 from scipy.stats import rankdata
 
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
 
 class ConfigData:
     def __init__(self, data_dir: str = "./data"):
@@ -1227,6 +1232,322 @@ class TechIndicator:
     def alpha101(self):
         return (self.mid_price - self.best_bid) / (self.spread + 0.001)
 
+class NewIndicator:
+    def __init__(self, df, n=15):
+        self.data = df
+        self.vwap = df["midpoint"]
+        self.spread = df["spread"]
+        self.num_asks = df["sells"]
+        self.num_bids = df["buys"]
+
+        self.best_bid = self.vwap - df["bids_distance_3"]  # The best/highest bid price
+        self.best_ask = self.vwap + df["asks_distance_3"]  # The best/lowest ask price
+        self.mid_price = (self.best_bid + self.best_ask) / 2
+        self.bid_volume = df["bids_notional_3"]  # The best/highest bid volume
+        self.ask_volume = df["asks_notional_3"]  # The best/lowest ask volume
+
+        self.n = n 
+
+    def calculate_cumulative_notionals(self):
+        for i in range(self.n):
+            self.data[f'cumulative_bids_notional_0_to_{i+1}'] = self.data[[f'bids_notional_{j}' for j in range(i+1)]].sum(axis=1)
+            self.data[f'cumulative_asks_notional_0_to_{i+1}'] = self.data[[f'asks_notional_{j}' for j in range(i+1)]].sum(axis=1)
+
+    def calculate_bid_ask_volatility(self):
+        for i in range(self.n):
+            self.data[f'volatility_bids_distance_0_to_{i+1}'] = self.data[[f'bids_distance_{j}' for j in range(i+1)]].std(axis=1)
+            self.data[f'volatility_asks_distance_0_to_{i+1}'] = self.data[[f'asks_distance_{j}' for j in range(i+1)]].std(axis=1)
+
+    def calculate_price_impact(self):
+        for i in range(1, self.n):
+            self.data[f'price_impact_0_to_{i+1}'] = self.data[f'asks_distance_{i}'] - self.data[f'bids_distance_{i}']
+
+    def calculate_bid_ask_imbalance(self):
+        for i in range(self.n):
+            self.data[f'imbalance_bids_0_to_{i+1}'] = self.data[[f'bids_notional_{j}' for j in range(i+1)]].sum(axis=1) - self.data[[f'asks_notional_{j}' for j in range(i+1)]].sum(axis=1)
+
+    def calculate_market_depth_to_spread_ratio(self):
+        for i in range(self.n):
+            self.data[f'depth_to_spread_ratio_0_to_{i+1}'] = self.data[[f'bids_notional_{j}' for j in range(i+1)]].sum(axis=1) / (self.data[f'asks_distance_{i}'] - self.data[f'bids_distance_{i}'])
+
+    def calculate_support_resistance(self):
+        for i in range(self.n):
+            self.data[f'support_level_0_to_{i+1}'] = self.data[[f'bids_notional_{j}' for j in range(i+1)]].idxmax(axis=1)
+            self.data[f'resistance_level_0_to_{i+1}'] = self.data[[f'asks_notional_{j}' for j in range(i+1)]].idxmax(axis=1)
+
+    def calculate_liquidity_pressure(self):
+        for i in range(self.n):
+            self.data[f'liquidity_pressure_{i}'] = self.data[f'bids_notional_{i}'] / (self.data[f'bids_distance_{i}'] + 1e-6)  # Avoid division by zero
+            self.data[f'liquidity_pressure_asks_{i}'] = self.data[f'asks_notional_{i}'] / (self.data[f'asks_distance_{i}'] + 1e-6)  # Avoid division by zero
+
+    def calculate_slippage(self):
+        for i in range(self.n):  # Levels 0 to 15
+            self.data[f'slippage_{i}'] = np.abs(self.data[f'asks_distance_{i}'] - self.data[f'bids_distance_{i}'])
+
+    def order_flow_momentum(self):
+        for i in range(self.n):  # Levels 0 to 15
+            self.data[f'order_flow_momentum_{i}'] = self.data[f'bids_notional_{i}'].diff() + self.data[f'asks_notional_{i}'].diff()
+
+    # Liquidity Imbalance Growth
+    def liquidity_imbalance_growth(self):
+        self.data['total_bid_notional'] = self.data[[f'bids_notional_{i}' for i in range(self.n)]].sum(axis=1)
+        self.data['total_ask_notional'] = self.data[[f'asks_notional_{i}' for i in range(self.n)]].sum(axis=1)
+        self.data['liquidity_imbalance'] = self.data['total_bid_notional'] - self.data['total_ask_notional']
+        self.data['liquidity_imbalance_growth'] = self.data['liquidity_imbalance'].diff()
+
+    # Order Book Depth Price Discovery: Measure depth of order book
+    def order_book_depth(self):
+        self.data['total_order_book_depth'] = self.data[[f'bids_notional_{i}' for i in range(self.n)]].sum(axis=1) + \
+                                    self.data[[f'asks_notional_{i}' for i in range(self.n)]].sum(axis=1)
+
+    # Midpoint Drift
+    def midpoint_drift(self):
+        self.data['midpoint_drift'] = self.data['midpoint'].diff()
+
+    # Cancellation Pattern
+    def cancellation_pattern(self):
+        for i in range(self.n):  # Levels 0 to 15
+            self.data[f'cancellation_ratio_{i}'] = (self.data[f'bids_cancel_notional_{i}'] + self.data[f'asks_cancel_notional_{i}']) / \
+                                            (self.data[f'bids_notional_{i}'] + self.data[f'asks_notional_{i}'])
+
+    # Cancellations and Replacements
+    def cancellations_and_replacements(self):
+        for i in range(self.n):  # Levels 0 to 15
+            self.data[f'cancellations_and_replacements_{i}'] = self.data[f'bids_cancel_notional_{i}'] + self.data[f'asks_cancel_notional_{i}']
+
+    # Market Depth Participation
+    def market_depth_participation(self):
+        self.data['total_market_depth'] = self.data[['bids_notional_0', 'bids_notional_1', 'bids_notional_2', 'bids_notional_3', 
+                                        'bids_notional_4', 'bids_notional_5', 'bids_notional_6', 'bids_notional_7', 
+                                        'bids_notional_8', 'bids_notional_9', 'bids_notional_10', 'bids_notional_11', 
+                                        'bids_notional_12', 'bids_notional_13', 'bids_notional_14']].sum(axis=1) + \
+                                    self.data[['asks_notional_0', 'asks_notional_1', 'asks_notional_2', 'asks_notional_3', 
+                                        'asks_notional_4', 'asks_notional_5', 'asks_notional_6', 'asks_notional_7', 
+                                        'asks_notional_8', 'asks_notional_9', 'asks_notional_10', 'asks_notional_11', 
+                                        'asks_notional_12', 'asks_notional_13', 'asks_notional_14']].sum(axis=1)
+        self.data['market_depth_participation'] = self.data['total_market_depth'] / (self.data['total_bid_notional'] + self.data['total_ask_notional'])
+
+    # Liquidity-to-Volume Ratio
+    def liquidity_to_volume_ratio(self):
+        self.data['liquidity_to_volume_ratio'] = (self.data['total_bid_notional'] + self.data['total_bid_notional']) / self.data['spread']
+
+    # Volatility of Spread
+    def volatility_of_spread(self):
+        for i in range(self.n):  # Levels 0 to 15
+            self.data[f'spread_volatility_{i}'] = self.data[f'asks_distance_{i}'].rolling(window=10).std() + self.data[f'bids_distance_{i}'].rolling(window=10).std()
+
+    # Implied Order Book Volatility
+    def implied_order_book_volatility(self):
+        self.data['order_book_volatility'] = (self.data[['bids_notional_0', 'bids_notional_1', 'bids_notional_2']].sum(axis=1) + 
+                                    self.data[['asks_notional_0', 'asks_notional_1', 'asks_notional_2']].sum(axis=1)).rolling(window=10).std() * self.data['spread']
+
+    # Liquidity Pressure-to-Price Ratio
+    def liquidity_pressure_to_price(self):
+        self.data['liquidity_pressure_to_price'] = (self.data['total_bid_notional'] + self.data['total_bid_notional']) / self.data['midpoint']
+
+    # Liquidity Injection/Withdrawal
+    def liquidity_injection_withdrawal(self):
+        self.data['liquidity_injection'] = self.data[['bids_notional_0', 'bids_notional_1', 'bids_notional_2']].diff(axis=1).sum(axis=1) + \
+                                    self.data[['asks_notional_0', 'asks_notional_1', 'asks_notional_2']].diff(axis=1).sum(axis=1)
+
+    # Liquidity Shock
+    def liquidity_shock(self):
+        self.data['liquidity_shock'] = np.abs(self.data[['bids_notional_0', 'bids_notional_1', 'bids_notional_2']].diff().sum(axis=1)) + \
+                                np.abs(self.data[['asks_notional_0', 'asks_notional_1', 'asks_notional_2']].diff().sum(axis=1))
+
+    # Market Tightness Ratio
+    def market_tightness_ratio(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'market_tightness_{i}'] = self.data['spread'] / (self.data[f'bids_notional_{i}'] + self.data[f'asks_notional_{i}'] +
+                                                        self.data[f'bids_limit_notional_{i}'] + self.data[f'asks_limit_notional_{i}'] +
+                                                        self.data[f'bids_market_notional_{i}'] + self.data[f'asks_market_notional_{i}'])
+
+    # Depth-Tightness Index
+    def depth_tightness_index(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'depth_tightness_{i}'] = (self.data[f'bids_notional_{i}'] + self.data[f'asks_notional_{i}'] +
+                                        self.data[f'bids_limit_notional_{i}'] + self.data[f'asks_limit_notional_{i}'] +
+                                        self.data[f'bids_market_notional_{i}'] + self.data[f'asks_market_notional_{i}']) / self.data['spread']
+
+    # Bid vs Ask Imbalance Over Time
+    def bid_ask_imbalance(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'bid_ask_imbalance_{i}'] = (self.data[f'bids_notional_{i}'] + self.data[f'bids_limit_notional_{i}'] +
+                                            self.data[f'bids_market_notional_{i}']) - (self.data[f'asks_notional_{i}'] +
+                                                                                self.data[f'asks_limit_notional_{i}'] +
+                                                                                self.data[f'asks_market_notional_{i}'])
+
+    # Relative Liquidity Pressure
+    def relative_liquidity_pressure(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            avg_liquidity = (self.data[f'bids_notional_{i}'] + self.data[f'asks_notional_{i}'] +
+                            self.data[f'bids_limit_notional_{i}'] + self.data[f'asks_limit_notional_{i}'] +
+                            self.data[f'bids_market_notional_{i}'] + self.data[f'asks_market_notional_{i}']) / 2
+            self.data[f'relative_liquidity_pressure_{i}'] = (self.data[f'bids_notional_{i}'] + self.data[f'bids_limit_notional_{i}'] +
+                                                    self.data[f'bids_market_notional_{i}'] - 
+                                                    (self.data[f'asks_notional_{i}'] + self.data[f'asks_limit_notional_{i}'] +
+                                                    self.data[f'asks_market_notional_{i}'])) / avg_liquidity
+
+    # Cumulative Depth Relative to Price Change
+    def cumulative_depth_price_change(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'cumulative_depth_{i}'] = self.data[[f'bids_notional_{i}', f'asks_notional_{i}',
+                                            f'bids_limit_notional_{i}', f'asks_limit_notional_{i}',
+                                            f'bids_market_notional_{i}', f'asks_market_notional_{i}']].sum(axis=1)
+            self.data[f'cumulative_depth_price_change_{i}'] = self.data[f'cumulative_depth_{i}'] / self.data['midpoint']
+
+    # Cumulative Cancellations
+    def cumulative_cancellations(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'cumulative_cancellations_{i}'] = self.data[[f'bids_cancel_notional_{i}', f'asks_cancel_notional_{i}']].sum(axis=1)
+
+    # Cross-Level Imbalance
+    def cross_level_imbalance(self):
+        for i in range(0, self.n - 2):  # Levels 1 to 15
+            self.data[f'cross_level_imbalance_{i}'] = (self.data[[f'bids_notional_{i}', f'bids_notional_{i+1}', f'bids_notional_{i+2}',
+                                                    f'bids_limit_notional_{i}', f'bids_limit_notional_{i+1}', 
+                                                    f'bids_limit_notional_{i+2}',
+                                                    f'bids_market_notional_{i}', f'bids_market_notional_{i+1}',
+                                                    f'bids_market_notional_{i+2}']].sum(axis=1) -
+                                                self.data[[f'asks_notional_{i}', f'asks_notional_{i+1}', f'asks_notional_{i+2}',
+                                                    f'asks_limit_notional_{i}', f'asks_limit_notional_{i+1}',
+                                                    f'asks_limit_notional_{i+2}',
+                                                    f'asks_market_notional_{i}', f'asks_market_notional_{i+1}',
+                                                    f'asks_market_notional_{i+2}']].sum(axis=1))
+
+    # Level Interactions and Momentum
+    def level_interactions_momentum(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'level_interaction_momentum_{i}'] = self.data[[f'bids_notional_{i}', f'asks_notional_{i}',
+                                                        f'bids_limit_notional_{i}', f'asks_limit_notional_{i}',
+                                                        f'bids_market_notional_{i}', f'asks_market_notional_{i}']].diff(axis=1).sum(axis=1)
+
+    # Liquidity Resilience Index
+    def liquidity_resilience_index(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'liquidity_resilience_{i}'] = (self.data['spread'] / 
+                                            (self.data[f'bids_notional_{i}'] + self.data[f'asks_notional_{i}'] +
+                                                self.data[f'bids_limit_notional_{i}'] + self.data[f'asks_limit_notional_{i}'] +
+                                                self.data[f'bids_market_notional_{i}'] + self.data[f'asks_market_notional_{i}']))
+    # Liquidity Stress Indicator
+    def liquidity_stress_indicator(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'liquidity_stress_{i}'] = (self.data[f'bids_notional_{i}'].diff() + self.data[f'asks_notional_{i}'].diff() +
+                                        self.data[f'bids_limit_notional_{i}'].diff() + self.data[f'asks_limit_notional_{i}'].diff() +
+                                        self.data[f'bids_market_notional_{i}'].diff() + self.data[f'asks_market_notional_{i}'].diff())
+
+    # High-Frequency Activity Indicator
+    def high_frequency_activity(self):
+        for i in range(0, self.n):  # Levels 1 to 15
+            self.data[f'high_frequency_activity_{i}'] = np.abs(self.data[f'bids_notional_{i}'].diff()) + np.abs(self.data[f'asks_notional_{i}'].diff())
+
+    def market_liquidity(self):
+        # Loop over all 15 levels (0 to 14) for the market liquidity factor
+        liquidity_columns = [
+            f'bids_notional_{i}' for i in range(self.n)
+        ] + [
+            f'asks_notional_{i}' for i in range(self.n)
+        ] + [
+            f'bids_market_notional_{i}' for i in range(self.n)
+        ] + ['sells', 'buys']
+
+        # Calculate the market liquidity factor
+        self.data['market_liquidity_factor'] = sum(self.data[col] for col in liquidity_columns) / len(liquidity_columns)
+
+    def price_pressure_factor(self):
+        # Price Pressure Factor: Combining bid-ask distances and notional values
+        pressure_columns = [
+            (f'bids_distance_{i}', f'bids_limit_notional_{i}') for i in range(self.n)
+        ] + [
+            (f'asks_distance_{i}', f'asks_limit_notional_{i}') for i in range(self.n)
+        ]
+
+        # Calculate the price pressure factor
+        self.data['price_pressure_factor'] = 0
+        for bid_dist_col, bid_notional_col in pressure_columns[:15]:  # for bids
+            self.data['price_pressure_factor'] += (self.data[bid_dist_col] * self.data[bid_notional_col])
+
+        for ask_dist_col, ask_notional_col in pressure_columns[15:]:  # for asks
+            self.data['price_pressure_factor'] -= (self.data[ask_dist_col] * self.data[ask_notional_col])
+
+    def bid_ask_spread(self):
+        #  **Bid-Ask Spread Factor**: Direct calculation from bid-ask distances
+        self.data['bid_ask_spread'] = 0
+        for i in range(self.n):
+            self.data['bid_ask_spread'] += (self.data[f'bids_distance_{i}'] - self.data[f'asks_distance_{i}'])
+
+    def supply_demand_pressure(self):
+        # **Supply-Demand Pressure**: Difference between buys and sells
+        self.data['supply_demand_pressure'] = self.data['buys'] - self.data['sells']
+
+    def cancellation_factor(self):
+        # **Cancellation Factor**: Assuming you have cancel notional columns like `bids_cancel_notional_0`, `asks_cancel_notional_0`
+        # Example factor
+        cancel_columns = [
+            f'bids_cancel_notional_{i}' for i in range(self.n)
+        ] + [
+            f'asks_cancel_notional_{i}' for i in range(self.n)
+        ]
+
+        # Assuming we want to calculate the average cancellation factor
+        self.data['cancellation_factor'] = sum(self.data[col] for col in cancel_columns) / len(cancel_columns)
+
+    def run_all(self):
+        self.calculate_cumulative_notionals()
+        self.calculate_bid_ask_volatility()
+        self.calculate_price_impact()
+        self.calculate_bid_ask_imbalance()
+        self.calculate_market_depth_to_spread_ratio()
+        # self.calculate_support_resistance()
+        self.calculate_liquidity_pressure()
+
+        self.calculate_slippage()
+        # self.implied_slippage()
+        self.order_flow_momentum()
+        self.liquidity_imbalance_growth()
+        self.order_book_depth()
+        self.midpoint_drift()
+        self.cancellation_pattern()
+        self.cancellations_and_replacements()
+        self.market_depth_participation()
+        self.liquidity_to_volume_ratio()
+        self.volatility_of_spread()
+        self.implied_order_book_volatility()
+
+        self.liquidity_pressure_to_price()
+        self.liquidity_injection_withdrawal()
+        self.liquidity_shock()
+        self.market_tightness_ratio()
+        self.depth_tightness_index()
+
+        self.bid_ask_imbalance()
+        self.relative_liquidity_pressure()
+
+        self.cumulative_depth_price_change()
+        self.cumulative_cancellations()
+        self.cross_level_imbalance()
+        self.level_interactions_momentum()
+        self.liquidity_resilience_index()
+        self.liquidity_stress_indicator()
+        self.high_frequency_activity()
+        self.market_liquidity()
+        self.price_pressure_factor()
+        self.bid_ask_spread()
+        self.supply_demand_pressure()
+        self.cancellation_factor()
+        # # Automatically run all methods (excluding __init__)
+        # for method_name, method in self.__class__.__dict__.items():
+        #     # Check if the method is callable (i.e., not an attribute) and doesn't start with '_'
+        #     if callable(method) and not method_name.startswith('_') and method_name != 'get_data':
+        #         print(f"Running {method_name}...")
+        #         method(self)  # Call the method
+        # return  
+
+    def get_data(self):
+        # To access the updated data
+        return self.data
+
+
 
 def normalize_with_quantiles(arys, q_low=0.01, q_high=0.99):
     # 计算每列的 0.01 和 0.99 分位数
@@ -1283,6 +1604,29 @@ def seq_to_label(ary, win_sizes=(10, 20, 40, 80, 160), if_print=False):
     # assert labels.shape == (min_length, len(win_sizes))
     return labels
 
+def run_pca_pipeline(dataframe, n_components=200):
+    """
+    Applies imputation, scaling, and PCA to the input DataFrame.
+    
+    Parameters:
+        dataframe (pd.DataFrame): The input data.
+        n_components (int): Number of PCA components to keep.
+    
+    Returns:
+        X_pca (np.ndarray): Transformed PCA features.
+        pipeline (Pipeline): The fitted sklearn pipeline.
+        explained_variance (float): Total explained variance ratio.
+    """
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+        ('pca', PCA(n_components=n_components))
+    ])
+    
+    X_pca = pipeline.fit_transform(dataframe)
+    explained_variance = pipeline.named_steps['pca'].explained_variance_ratio_.sum()
+    
+    return X_pca, explained_variance
 
 """run"""
 
@@ -1293,7 +1637,8 @@ def convert_btc_csv_to_btc_npy(args=ConfigData()):
     label_ary_path = args.label_ary_path
 
     df = pd.read_csv(csv_path)
-
+    df.columns = df.columns.str.strip()
+    print(df.columns)
     if not os.path.exists(label_ary_path):
         price_ary = df["midpoint"].values
         label_ary = seq_to_label(ary=price_ary, win_sizes=(10, 20, 30, 60, 80, 100, 200, 400), if_print=False)
@@ -1301,27 +1646,19 @@ def convert_btc_csv_to_btc_npy(args=ConfigData()):
         print(f"| save in {label_ary_path}")
 
     if not os.path.exists(input_ary_path):
-        indicator = TechIndicator(df=df)
-
+        # indicator = TechIndicator(df=df)
+        indicator = NewIndicator(df, n=15)
         alpha_arys = []
         timer0 = time.time()
         timer1 = time.time()
-        for i in range(1, 101 + 1):
-            alpha_df = getattr(indicator, f"alpha{i:03}")()
-            used_time0 = time.time() - timer0
-            used_time1 = time.time() - timer1
-            timer1 = time.time()
-            print(
-                f"{i:3}  {used_time0:4.0f} {used_time1:4.0f}",
-                alpha_df.shape,
-                np.isnan(alpha_df.values).sum(),
-            )
-
-            alpha_ary = np.nan_to_num(alpha_df.values, nan=0.0, neginf=0.0, posinf=0.0)
-            alpha_arys.append(alpha_ary)
-        alpha_arys = np.stack(alpha_arys, axis=1)
-        alpha_arys = normalize_with_quantiles(alpha_arys).astype(np.float16)
-        np.save(args.input_ary_path, alpha_arys)
+        indicator.run_all()
+        updated_data = indicator.get_data()
+        updated_data = updated_data.drop(columns=['Unnamed: 0.1', 'Unnamed: 0'], errors='ignore')
+        updated_data = updated_data.drop(columns=['system_time'], errors='ignore')
+         # Using PCA to reduce diminish the factor to top 200 without 96 % information 
+        pca_arys, explained_variance = run_pca_pipeline(updated_data)
+#         alpha_arys = normalize_with_quantiles(pca_arys).astype(np.float16)
+        np.save(args.input_ary_path, pca_arys)
         print(f"| save in {input_ary_path}")
 
 
