@@ -64,7 +64,7 @@ python seq_data.py
 This script:
 
 - Reads BTC CSV data and extracts level order book information
-- Generates NewTech factors describing market microstructure
+- Generates NewTech factors describing market microstructure because 101 alpha factor is mostly designed for stock trading.
 - Converts data to normalized numpy arrays using z-score transformation
 - Outputs technical factor sequences for model training
 
