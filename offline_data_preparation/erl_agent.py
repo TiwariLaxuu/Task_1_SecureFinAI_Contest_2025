@@ -7,7 +7,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from erl_config import Config
 from erl_replay_buffer import ReplayBuffer
-from erl_net import QNetTwin, QNetTwinDuel 
+from erl_net import QNetTwin, QNetTwinDuel, ActorDiscretePPO, CriticPPO
 
 
 def get_optim_param(optimizer: torch.optim) -> list:  # backup
@@ -232,4 +232,242 @@ class AgentTwinD3QN(AgentDoubleDQN):
     def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
         self.act_class = getattr(self, "act_class", QNetTwin)
         self.cri_class = getattr(self, "cri_class", None)  # means `self.cri = self.act`
+        super().__init__(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim, gpu_id=gpu_id, args=args)
+
+
+import os
+import torch
+import torch.nn as nn
+from typing import Tuple
+from copy import deepcopy
+from torch import Tensor
+from torch.distributions import Normal, Categorical
+from torch.nn.utils import clip_grad_norm_
+
+from erl_config import Config
+from erl_replay_buffer import ReplayBuffer
+
+
+class AgentPPO:
+    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
+        self.act_class = getattr(self, "act_class", QNetTwin)
+        self.cri_class = getattr(self, "cri_class", None)  # means `self.cri = self.act`
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = args.gamma
+        self.num_envs = args.num_envs
+        self.batch_size = args.batch_size
+        self.repeat_times = args.repeat_times
+        self.reward_scale = args.reward_scale
+        self.learning_rate = args.learning_rate
+        self.if_off_policy = getattr(args, "if_off_policy", False)
+        self.clip_grad_norm = args.clip_grad_norm
+        self.soft_update_tau = args.soft_update_tau
+        self.state_value_tau = args.state_value_tau
+        
+        # PPO specific parameters
+        self.lambda_gae = getattr(args, "lambda_gae", 0.95)
+        self.ratio_clip = getattr(args, "ratio_clip", 0.2)
+        self.entropy_coef = getattr(args, "entropy_coef", 0.02)
+        self.kl_coef = getattr(args, "kl_coef", 0.5)
+        self.kl_target = getattr(args, "kl_target", 0.01)
+        
+        self.device = torch.device(f"cuda:{gpu_id}" if (torch.cuda.is_available() and (gpu_id >= 0)) else "cpu")
+        self.last_state = None  # last state of the trajectory for training
+        
+        '''network'''
+        self.act = self.act_class(net_dims, state_dim, action_dim).to(self.device)
+        self.cri = self.cri_class(net_dims, state_dim).to(self.device) \
+            if hasattr(self, "cri_class") else self.act
+            
+        '''optimizer'''
+        self.act_optimizer = torch.optim.Adam(self.act.parameters(), self.learning_rate)
+        self.cri_optimizer = torch.optim.Adam(self.cri.parameters(), self.learning_rate) \
+            if hasattr(self, "cri_class") else self.act_optimizer
+            
+        self.criterion = nn.MSELoss()
+        
+        """save and load"""
+        self.save_attr_names = {'act', 'cri', 'act_optimizer', 'cri_optimizer'}
+
+    def explore_env(self, env, horizon_len: int, if_random: bool = False) -> Tuple[Tensor, ...]:
+        """
+        Collect trajectories through the actor-environment interaction.
+        
+        Returns:
+            states: shape (horizon_len, num_envs, state_dim)
+            actions: shape (horizon_len, num_envs, action_dim)
+            rewards: shape (horizon_len, num_envs)
+            undones: shape (horizon_len, num_envs)
+            logprobs: shape (horizon_len, num_envs)
+            values: shape (horizon_len, num_envs)
+        """
+        states = torch.zeros((horizon_len, self.num_envs, self.state_dim), dtype=torch.float32).to(self.device)
+        actions = torch.zeros((horizon_len, self.num_envs, self.action_dim), dtype=torch.float32).to(self.device)
+        rewards = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
+        dones = torch.zeros((horizon_len, self.num_envs), dtype=torch.bool).to(self.device)
+        logprobs = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
+        values = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
+        
+        state = self.last_state
+        get_action = self.act.get_action
+        for t in range(horizon_len):
+#             action = torch.randint(self.action_dim, size=(self.num_envs, 1)) if if_random \
+#                 else get_action(state).detach()
+            action, logprob = self.act.get_action_logprob(state)
+            value = self.cri(state)
+            
+            next_state, reward, done, _ = env.step(action)
+            
+            states[t] = state
+            actions[t] = action
+            rewards[t] = reward
+            dones[t] = done
+            logprobs[t] = logprob
+            values[t] = value
+            
+            state = next_state
+            
+        self.last_state = state
+        rewards *= self.reward_scale
+        undones = 1.0 - dones.type(torch.float32)
+        
+        return states, actions, rewards, undones, logprobs, values
+
+    def compute_advantages(self, rewards: Tensor, values: Tensor, undones: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Compute advantages using Generalized Advantage Estimation (GAE).
+        
+        Returns:
+            advantages: shape (horizon_len, num_envs)
+            returns: shape (horizon_len, num_envs)
+        """
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+        
+        masks = undones * self.gamma
+        horizon_len = rewards.shape[0]
+        
+        last_state = self.last_state
+        next_value = self.cri(last_state).detach()
+        
+        gae = 0
+        for t in reversed(range(horizon_len)):
+            delta = rewards[t] + masks[t] * next_value - values[t]
+            gae = delta + masks[t] * self.lambda_gae * gae
+            advantages[t] = gae
+            returns[t] = gae + values[t]
+            next_value = values[t]
+            
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages, returns
+
+    def update_net(self, buffer: ReplayBuffer) -> Tuple[float, ...]:
+        """
+        Update the actor and critic networks using PPO.
+        
+        Returns:
+            obj_critic: critic loss
+            obj_actor: actor loss
+            kl: KL divergence
+            entropy: entropy of the policy
+        """
+        states, actions, rewards, undones, old_logprobs, old_values = buffer.sample()
+        advantages, returns = self.compute_advantages(rewards, old_values, undones)
+        
+        obj_critics = 0.0
+        obj_actors = 0.0
+        kls = 0.0
+        entropies = 0.0
+        update_times = 2
+#         try:
+#             update_times = int(buffer.cur_size * self.repeat_times / self.batch_size)
+#         except:
+#             update_times = 2
+        assert update_times >= 1
+        
+        for _ in range(update_times):
+            indices = torch.randint(0, 10, size=(self.batch_size,))
+            
+            # Get batch data
+            batch_states = states[indices]
+            batch_actions = actions[indices]
+            batch_old_logprobs = old_logprobs[indices]
+            batch_advantages = advantages[indices]
+            batch_returns = returns[indices]
+            
+            # Get new action probabilities and values
+            new_logprobs, entropy = self.act.get_logprob_entropy(batch_states, batch_actions)
+            new_values = self.cri(batch_states)
+            
+            # Calculate ratios
+            log_ratios = new_logprobs - batch_old_logprobs
+            ratios = log_ratios.exp()
+            
+            # Policy loss
+            surr1 = ratios * batch_advantages
+            surr2 = torch.clamp(ratios, 1.0 - self.ratio_clip, 1.0 + self.ratio_clip) * batch_advantages
+            obj_actor = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy.mean()
+            
+            # Value loss
+            obj_critic = self.criterion(new_values, batch_returns)
+            
+            # KL divergence
+            with torch.no_grad():
+                kl = ((ratios.log() - log_ratios) * ratios).mean()
+                kls += kl.item()
+                
+            # Optimize
+            self.optimizer_update(self.act_optimizer, obj_actor)
+            self.optimizer_update(self.cri_optimizer, obj_critic)
+            
+            obj_actors += obj_actor.item()
+            obj_critics += obj_critic.item()
+            entropies += entropy.mean().item()
+            
+        return (obj_critics / update_times, 
+                obj_actors / update_times)
+#                 kls / update_times, 
+#                 entropies / update_times)
+
+
+    def save_or_load_agent(self, cwd: str, if_save: bool):
+        """save or load training files for Agent"""
+        assert self.save_attr_names.issuperset({'act', 'cri', 'act_optimizer', 'cri_optimizer'})
+
+        for attr_name in self.save_attr_names:
+            file_path = f"{cwd}/{attr_name}.pth"
+            if if_save:
+                torch.save(getattr(self, attr_name), file_path)
+            elif os.path.isfile(file_path):
+                setattr(self, attr_name, torch.load(file_path, map_location=self.device))
+
+    @staticmethod
+    def soft_update(target_net: torch.nn.Module, current_net: torch.nn.Module, tau: float):
+        """soft update target network"""
+        for tar, cur in zip(target_net.parameters(), current_net.parameters()):
+            tar.data.copy_(cur.data * tau + tar.data * (1.0 - tau))
+
+    def optimizer_update(self, optimizer: torch.optim, objective: Tensor):
+        """minimize the optimization objective"""
+        optimizer.zero_grad()
+        objective.backward()
+        clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
+        optimizer.step()
+
+
+class AgentPPOContinuous(AgentPPO):
+    """PPO for continuous action spaces"""
+    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
+        self.act_class = getattr(self, "act_class", ActorPPO)  # Gaussian policy
+        self.cri_class = getattr(self, "cri_class", CriticPPO)
+        super().__init__(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim, gpu_id=gpu_id, args=args)
+
+
+class AgentPPODiscrete(AgentPPO):
+    """PPO for discrete action spaces"""
+    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
+        self.act_class = getattr(self, "act_class", ActorDiscretePPO)  # Categorical policy
+        self.cri_class = getattr(self, "cri_class", CriticPPO)
         super().__init__(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim, gpu_id=gpu_id, args=args)

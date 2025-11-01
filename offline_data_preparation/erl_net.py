@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
-
+from torch.distributions import Categorical, Normal
 
 TEN = torch.Tensor
-
 
 class QNetBase(nn.Module):  # nn.Module is a standard PyTorch Network
     def __init__(self, state_dim: int, action_dim: int):
